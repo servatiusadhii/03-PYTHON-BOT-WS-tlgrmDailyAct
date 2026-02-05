@@ -1,94 +1,117 @@
 from telegram import Update, ReplyKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
 from datetime import datetime
-import random
+import asyncio
 import os
 
 TOKEN = os.getenv("BOT_TOKEN")
 
-if not TOKEN:
-    raise RuntimeError("BOT_TOKEN belum diset")
+# storage sederhana (per user)
+user_notes = {}
+user_reminders = {}
 
-# Keyboard menu
-menu = ReplyKeyboardMarkup(
+MENU = ReplyKeyboardMarkup(
     [
-        ["1️⃣ Cek Hari Ini"],
-        ["2️⃣ Info Hari Ini"],
-        ["3️⃣ Exit"]
+        ["1️⃣ Hari ini"],
+        ["2️⃣ Catatan saya"],
+        ["3️⃣ Reminder"],
+        ["4️⃣ Exit"],
     ],
     resize_keyboard=True
 )
 
-# Command /start
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Halo 👋\nSilakan pilih menu:",
-        reply_markup=menu
+        "👋 Halo!\n"
+        "Gue asisten pribadi lo.\n\n"
+        "Pilih menu di bawah 👇",
+        reply_markup=MENU
     )
 
-async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
+    user_id = update.message.from_user.id
 
-    # MENU 1
-    if "Cek Hari Ini" in text:
+    if text.startswith("1"):
         now = datetime.now()
-        hari = now.strftime("%A")
-        tanggal = now.strftime("%d %B %Y")
-        jam = now.strftime("%H:%M:%S")
-
         await update.message.reply_text(
-            f"📅 Hari : {hari}\n"
-            f"📆 Tanggal : {tanggal}\n"
-            f"⏰ Jam : {jam}"
+            f"📅 Hari ini:\n"
+            f"Hari: {now.strftime('%A')}\n"
+            f"Tanggal: {now.strftime('%d %B %Y')}\n"
+            f"Jam: {now.strftime('%H:%M:%S')}"
         )
 
-    # MENU 2 (tanpa API)
-    elif "Info Hari Ini" in text:
-        cuaca = random.choice([
-            "☀️ Cerah",
-            "🌤️ Cerah Berawan",
-            "☁️ Berawan",
-            "🌧️ Hujan Ringan"
-        ])
-        suhu = random.randint(24, 33)
-
+    elif text.startswith("2"):
+        context.user_data["mode"] = "note"
         await update.message.reply_text(
-            "📊 Info Hari Ini\n"
-            f"🌡️ Perkiraan Suhu : {suhu}°C\n"
-            f"🌦️ Kondisi : {cuaca}\n\n"
-            "⚠️ *Catatan:* ini hanya perkiraan sederhana.",
+            "✍️ Kirim catatan lo.\n"
+            "Gue simpan khusus buat lo."
+        )
+
+    elif text.startswith("3"):
+        context.user_data["mode"] = "reminder"
+        await update.message.reply_text(
+            "⏰ Kirim reminder format:\n"
+            "`HH:MM | pesannya`",
             parse_mode="Markdown"
         )
 
-    # MENU 3
-    elif "Exit" in text:
+    elif text.startswith("4"):
         await update.message.reply_text(
-            "👋 Terima kasih!\nSampai jumpa.",
+            "👋 Sampai ketemu lagi!",
             reply_markup=None
         )
 
     else:
-        await update.message.reply_text("❗ Silakan pilih menu yang tersedia")
+        await update.message.reply_text("❓ Pilih menu yang tersedia.")
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    mode = context.user_data.get("mode")
+
+    if mode == "note":
+        user_notes.setdefault(user_id, []).append(update.message.text)
+        await update.message.reply_text("✅ Catatan tersimpan.")
+        context.user_data["mode"] = None
+
+    elif mode == "reminder":
+        try:
+            time_part, msg = update.message.text.split("|", 1)
+            hour, minute = map(int, time_part.strip().split(":"))
+            now = datetime.now()
+            target = now.replace(hour=hour, minute=minute, second=0)
+
+            delay = (target - now).total_seconds()
+            if delay < 0:
+                await update.message.reply_text("⛔ Waktunya sudah lewat.")
+                return
+
+            async def send_reminder():
+                await asyncio.sleep(delay)
+                await update.message.reply_text(f"⏰ Reminder:\n{msg.strip()}")
+
+            asyncio.create_task(send_reminder())
+            await update.message.reply_text("⏳ Reminder diset.")
+            context.user_data["mode"] = None
+
+        except:
+            await update.message.reply_text("❌ Format salah.")
+
+    else:
+        await update.message.reply_text("Pilih menu dulu ya 👇", reply_markup=MENU)
 
 if __name__ == "__main__":
-    from telegram.request import HTTPXRequest
-
-    request = HTTPXRequest(
-        connect_timeout=20,
-        read_timeout=20,
-        write_timeout=20
-    )
-
-    app = (
-        ApplicationBuilder()
-        .token(TOKEN)
-        .request(request)
-        .build()
-    )
+    app = ApplicationBuilder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT, handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_menu))
+    app.add_handler(MessageHandler(filters.TEXT, handle_text))
 
     print("Bot berjalan...")
-    app.run_polling(close_loop=False)
-
+    app.run_polling()
