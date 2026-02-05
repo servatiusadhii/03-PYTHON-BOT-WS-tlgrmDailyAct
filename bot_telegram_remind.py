@@ -2,8 +2,12 @@ from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 from datetime import datetime
 import random
+import os
 
-TOKEN = "7948305758:AAFaWIHzR-N7mW0q6S_z7DlpIJpPVsFSV7w"
+TOKEN = os.getenv("BOT_TOKEN")
+
+if not TOKEN:
+    raise RuntimeError("BOT_TOKEN belum diset")
 
 # Keyboard menu
 menu = ReplyKeyboardMarkup(
