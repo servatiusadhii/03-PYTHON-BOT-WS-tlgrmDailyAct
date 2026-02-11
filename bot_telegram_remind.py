@@ -201,11 +201,32 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ================= MAIN =================
 if __name__ == "__main__":
     import sys
+    import asyncio
+
     if "--daily-summary" in sys.argv:
         send_all_users_summary()
     else:
         app = ApplicationBuilder().token(BOT_TOKEN).build()
         app.add_handler(CommandHandler("start", start))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
+        # ===== DAILY SCHEDULER =====
+        async def daily_scheduler():
+            while True:
+                now = datetime.now()
+                # hitung detik sampai jam 00:01 besok
+                target = (datetime.now() + timedelta(days=1)).replace(hour=0, minute=1, second=0, microsecond=0)
+                wait_seconds = (target - now).total_seconds()
+                print(f"⏳ Menunggu {wait_seconds:.0f} detik sampai daily summary...")
+                await asyncio.sleep(wait_seconds)
+                print("📬 Mengirim daily summary ke semua user...")
+                try:
+                    send_all_users_summary()
+                except Exception as e:
+                    print(f"❌ Error saat daily summary: {e}")
+
+        # jalankan scheduler bersamaan dengan bot
+        asyncio.create_task(daily_scheduler())
+
         print("🤖 Bot keuangan running...")
         app.run_polling()
