@@ -168,63 +168,32 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🧮 Sisa dana : {rupiah(pemasukan - pengeluaran)}\n"
             f"💼 Saldo total : {rupiah(saldo)}"
         )
-    elif text == "📋 Catatan Hari Ini":
-        loading = await update.message.reply_text("⏳ Sedang memproses...")
-        data = get_rows_by_date(ws, today())
-        if not data:
-            await loading.edit_text("📭 Belum ada catatan hari ini.")
-            return
-        msg = "📋 CATATAN HARI INI\n\n"
-        for r in data:
-            msg += (
-                f"{r['timestamp']}\n"
-                f"{r['type']} | {rupiah(r['amount'])}\n"
-                f"Sisa : {rupiah(r['saldo_sisa'])}\n"
-                f"Leak : {r['leak']}\n\n"
-            )
-        await loading.edit_text(msg)
-    elif text == "📈 Lihat Spreadsheet":
-        await update.message.reply_text("📧 Masukkan email untuk dibagikan akses spreadsheet:")
-        context.user_data["awaiting_email"] = True
-    elif "awaiting_email" in context.user_data:
-        email = text
-        ws.share(email, perm_type='user', role='writer', notify=True)
-        await update.message.reply_text(f"✅ Spreadsheet telah dibagikan ke {email}")
-        context.user_data.clear()
 
 # ================= MAIN =================
 if __name__ == "__main__":
-    import sys
-
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     # ===== DAILY SCHEDULER =====
-    async def daily_scheduler():
+    async def daily_scheduler_task():
         while True:
             now = datetime.now()
             target = now.replace(hour=0, minute=1, second=0, microsecond=0)
             if now >= target:
                 target += timedelta(days=1)
             wait_seconds = (target - now).total_seconds()
-            
-            # sleep per 60 detik supaya bot tetap responsive
             while wait_seconds > 0:
-                sleep_time = min(wait_seconds, 60)
-                await asyncio.sleep(sleep_time)
-                wait_seconds -= sleep_time
-
+                await asyncio.sleep(min(wait_seconds, 60))
+                wait_seconds -= 60
             try:
                 print(f"📬 Mengirim daily summary ke semua user ({datetime.now()})")
                 send_all_users_summary()
             except Exception as e:
                 print(f"❌ Error saat daily summary: {e}")
 
-    # jalankan bot + scheduler bersamaan
-    async def main():
-        task_bot = asyncio.create_task(app.run_polling())
-        task_sched = asyncio.create_task(daily_scheduler())
-        await asyncio.gather(task_bot, task_sched)
+    # ===== Tambahkan scheduler sebagai task di Application =====
+    app.create_task(daily_scheduler_task())
 
-    asyncio.run(main())
+    print("🤖 Bot keuangan running...")
+    app.run_polling()
