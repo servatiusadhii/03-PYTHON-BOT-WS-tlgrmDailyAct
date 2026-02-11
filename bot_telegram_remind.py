@@ -1,221 +1,234 @@
-from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
-    ContextTypes,
     CommandHandler,
     MessageHandler,
+    ContextTypes,
     filters,
 )
-from datetime import datetime, time
+import gspread
 import os
+import json
+from google.oauth2.service_account import Credentials
+from datetime import datetime
 
-TOKEN = os.getenv("BOT_TOKEN")
+# ================= CONFIG =================
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+SPREADSHEET_NAME = "BOT Keuangan"
 
-# ===== MENU =====
-MENU = ReplyKeyboardMarkup(
-    [
-        ["💸 Catat Pengeluaran", "💰 Catat Pemasukan"],
-        ["📊 Ringkasan Hari Ini"],
-        ["📄 Lihat Semua Catatan"],
-        ["❌ Exit"],
-    ],
-    resize_keyboard=True
+# ================= GOOGLE SHEET =================
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
+
+creds_dict = json.loads(os.environ.get("GOOGLE_CREDENTIAL_JSON"))
+creds = Credentials.from_service_account_file(
+    creds_dict,
+    scopes=SCOPES
 )
+client = gspread.authorize(creds)
+spreadsheet = client.open(SPREADSHEET_NAME)
 
-# ===== START =====
+# ================= HELPER =================
+def rupiah(n):
+    return f"Rp {int(n):,}".replace(",", ".")
+
+def now_full():
+    return datetime.now().strftime("%A, %d %B %Y | %H:%M WIB")
+
+def today():
+    return datetime.now().strftime("%Y-%m-%d")
+
+# ================= USER SHEET =================
+def get_user_sheet(chat_id):
+    sheet_name = f"user_{chat_id}"
+    try:
+        ws = spreadsheet.worksheet(sheet_name)
+    except gspread.exceptions.WorksheetNotFound:
+        ws = spreadsheet.add_worksheet(
+            title=sheet_name,
+            rows=1000,
+            cols=10
+        )
+        ws.append_row([
+            "timestamp",
+            "type",
+            "amount",
+            "note",
+            "leak",
+            "saldo_sisa"
+        ])
+    return ws
+
+def get_today_rows(ws):
+    rows = ws.get_all_records()
+    return [r for r in rows if r["timestamp"].startswith(today())]
+
+def get_total(ws, tipe):
+    return sum(int(r["amount"]) for r in get_today_rows(ws) if r["type"] == tipe)
+
+def get_last_balance(ws):
+    rows = ws.get_all_records()
+    return int(rows[-1]["saldo_sisa"]) if rows else 0
+
+def save_record(ws, tipe, amount, note):
+    pemasukan = get_total(ws, "Pemasukan")
+    pengeluaran = get_total(ws, "Pengeluaran")
+    saldo = get_last_balance(ws)
+
+    leak = "NO"
+
+    if tipe == "Pemasukan":
+        pemasukan += amount
+        saldo += amount
+    else:
+        pengeluaran += amount
+        saldo -= amount
+        if pengeluaran > pemasukan:
+            leak = "YES"
+
+    ws.append_row([
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        tipe,
+        amount,
+        note,
+        leak,
+        saldo
+    ])
+
+    return pemasukan, pengeluaran, saldo, leak
+
+# ================= SPREADSHEET SHARE =================
+def create_and_share_user_sheet(chat_id, email):
+    # Ambil sheet user
+    ws = get_user_sheet(chat_id)
+    # Share SPREADSHEET ke email
+    spreadsheet.share(email, perm_type='user', role='writer', notify=True)
+    return ws
+
+
+def get_sheet_url(ws):
+    return f"{spreadsheet.url}#gid={ws.id}"
+
+# ================= COMMAND =================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-
-    context.user_data.setdefault("records", [])
-
-    # reminder tiap pagi jam 08:00
-    context.job_queue.run_daily(
-        morning_reminder,
-        time=time(hour=8, minute=0),
-        chat_id=chat_id,
-        name=str(chat_id)
-    )
-
+    keyboard = [
+        ["💰 Pemasukan", "💸 Pengeluaran"],
+        ["📊 Summary", "📋 Catatan Hari Ini"],
+        ["📈 Lihat Spreadsheet"],
+    ]
     await update.message.reply_text(
-        "👋 Halo bos!\n"
-        "⏰ Reminder target pengeluaran aktif tiap jam 08:00.\n"
-        "Pilih menu 👇",
-        reply_markup=MENU
+        "🤖 Bot Keuangan Aktif\nKelola keuangan harianmu dengan rapi 💸",
+        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True),
     )
 
-# ===== REMINDER PAGI =====
-async def morning_reminder(context: ContextTypes.DEFAULT_TYPE):
-    chat_id = context.job.chat_id
-
-    user_data = context.application.user_data.setdefault(chat_id, {})
-    user_data["state"] = "DAILY_LIMIT"
-    user_data["daily_date"] = datetime.now().date()
-
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text="☀️ Pagi bos!\nTarget maksimal pengeluaran hari ini berapa?"
-    )
-
-# ===== HANDLE TEXT =====
+# ================= HANDLER =================
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
-    state = context.user_data.get("state")
+    chat_id = update.effective_chat.id
+    ws = get_user_sheet(chat_id)
 
-    # ===== SET TARGET HARIAN =====
-    if state == "DAILY_LIMIT":
-        context.user_data["daily_limit"] = int(text)
-        context.user_data["daily_date"] = datetime.now().date()
-        context.user_data.pop("state", None)
+    # ================= INPUT Pemasukan/Pengeluaran =================
+    if text in ["💰 Pemasukan", "💸 Pengeluaran"]:
+        context.user_data["type"] = "Pemasukan" if "Pemasukan" in text else "Pengeluaran"
+        await update.message.reply_text("Masukkan nominal transaksi:")
 
-        await update.message.reply_text(
-            f"✅ Target hari ini diset: Rp {int(text):,}",
-            reply_markup=MENU
-        )
-        return
+    elif text.isdigit() and "type" in context.user_data:
+        context.user_data["amount"] = int(text)
+        await update.message.reply_text("Tambahkan catatan transaksi:")
 
-    # ===== CATAT PENGELUARAN =====
-    if text == "💸 Catat Pengeluaran":
-        context.user_data["state"] = "EXPENSE_AMOUNT"
-        await update.message.reply_text("💸 Masukkan jumlah pengeluaran:")
+    elif "amount" in context.user_data:
+        loading = await update.message.reply_text("⏳ Sedang memproses...")
 
-    elif state == "EXPENSE_AMOUNT":
-        context.user_data["temp_amount"] = int(text)
-        context.user_data["state"] = "EXPENSE_NOTE"
-        await update.message.reply_text("📝 Keterangan pengeluaran:")
+        tipe = context.user_data["type"]
+        amount = context.user_data["amount"]
+        note = text
 
-    elif state == "EXPENSE_NOTE":
-        now = datetime.now()
-        amount = context.user_data["temp_amount"]
-
-        today = now.date()
-        daily_limit = context.user_data.get("daily_limit")
-
-        daily_expense = sum(
-            r["amount"] for r in context.user_data["records"]
-            if r["type"] == "Pengeluaran" and r["time"].date() == today
-        )
-
-        is_leak = daily_limit and (daily_expense + amount > daily_limit)
-
-        record = {
-            "time": now,
-            "type": "Pengeluaran",
-            "amount": amount,
-            "note": text,
-            "leak": is_leak
-        }
-
-        context.user_data["records"].append(record)
-        context.user_data.pop("state", None)
+        pemasukan, pengeluaran, saldo, leak = save_record(ws, tipe, amount, note)
+        sisa = pemasukan - pengeluaran
+        context.user_data.clear()
 
         msg = (
-            "🛑 KEBOCORAN PEMBELIAN!\n" if is_leak else "✅ Pengeluaran tercatat!\n"
-        )
-        msg += (
-            f"🗓️ {now.strftime('%A, %d %B %Y')}\n"
-            f"⏰ {now.strftime('%H:%M:%S')}\n"
-            f"💰 Rp {amount:,}"
-        )
-
-        await update.message.reply_text(msg, reply_markup=MENU)
-
-    # ===== CATAT PEMASUKAN =====
-    elif text == "💰 Catat Pemasukan":
-        context.user_data["state"] = "INCOME_AMOUNT"
-        await update.message.reply_text("💰 Masukkan jumlah pemasukan:")
-
-    elif state == "INCOME_AMOUNT":
-        context.user_data["temp_amount"] = int(text)
-        context.user_data["state"] = "INCOME_NOTE"
-        await update.message.reply_text("📝 Keterangan pemasukan:")
-
-    elif state == "INCOME_NOTE":
-        now = datetime.now()
-        record = {
-            "time": now,
-            "type": "Pemasukan",
-            "amount": context.user_data["temp_amount"],
-            "note": text,
-            "leak": False
-        }
-
-        context.user_data["records"].append(record)
-        context.user_data.pop("state", None)
-
-        await update.message.reply_text(
-            "✅ Pemasukan tercatat!\n"
-            f"🗓️ {now.strftime('%A, %d %B %Y')}\n"
-            f"⏰ {now.strftime('%H:%M:%S')}",
-            reply_markup=MENU
+            f"✅ {tipe} berhasil dicatat\n\n"
+            f"🗓️ {now_full()}\n\n"
+            f"Nominal : {rupiah(amount)}\n"
+            f"Catatan : {note}\n\n"
+            f"📊 Ringkasan Hari Ini\n"
+            f"• Pemasukan : {rupiah(pemasukan)}\n"
+            f"• Pengeluaran : {rupiah(pengeluaran)}\n"
+            f"• Sisa dana : {rupiah(sisa)}\n"
         )
 
-    # ===== RINGKASAN =====
-    elif text == "📊 Ringkasan Hari Ini":
-        today = datetime.now().date()
+        if pemasukan > 0 and sisa <= pemasukan * 0.2 and leak == "NO":
+            msg += "\n⚠️ Sisa dana hari ini tinggal 20%."
 
-        income = sum(
-            r["amount"] for r in context.user_data["records"]
-            if r["type"] == "Pemasukan" and r["time"].date() == today
-        )
-        expense = sum(
-            r["amount"] for r in context.user_data["records"]
-            if r["type"] == "Pengeluaran" and r["time"].date() == today
+        if leak == "YES":
+            msg += "\n🚨 LEAK! Pengeluaran melebihi pemasukan."
+
+        await loading.edit_text(msg)
+
+    # ================= MENU =================
+    elif text == "📊 Summary":
+        loading = await update.message.reply_text("⏳ Sedang memproses...")
+
+        pemasukan = get_total(ws, "Pemasukan")
+        pengeluaran = get_total(ws, "Pengeluaran")
+        saldo = get_last_balance(ws)
+
+        await loading.edit_text(
+            f"📊 SUMMARY HARI INI\n\n"
+            f"🗓️ {now_full()}\n\n"
+            f"💰 Pemasukan : {rupiah(pemasukan)}\n"
+            f"💸 Pengeluaran : {rupiah(pengeluaran)}\n"
+            f"🧮 Sisa dana : {rupiah(pemasukan - pengeluaran)}\n"
+            f"💼 Saldo total : {rupiah(saldo)}"
         )
 
-        await update.message.reply_text(
-            f"📊 Ringkasan Hari Ini\n\n"
-            f"💰 Pemasukan: Rp {income:,}\n"
-            f"💸 Pengeluaran: Rp {expense:,}\n"
-            f"📉 Selisih: Rp {income - expense:,}"
-        )
+    elif text == "📋 Catatan Hari Ini":
+        loading = await update.message.reply_text("⏳ Sedang memproses...")
 
-    # ===== LIHAT SEMUA CATATAN =====
-    elif text == "📄 Lihat Semua Catatan":
-        records = context.user_data["records"]
-        if not records:
-            await update.message.reply_text("❗ Belum ada catatan.")
+        data = get_today_rows(ws)
+        if not data:
+            await loading.edit_text("📭 Belum ada catatan hari ini.")
             return
 
-        normal = [r for r in records if not r.get("leak")]
-        leak = [r for r in records if r.get("leak")]
-
-        msg = "📄 CATATAN NORMAL\n\n"
-        for r in normal:
+        msg = "📋 CATATAN HARI INI\n\n"
+        for r in data:
             msg += (
-                f"- {r['type']} | Rp {r['amount']:,}\n"
-                f"  {r['time'].strftime('%d %b %Y %H:%M')} | {r['note']}\n\n"
+                f"{r['timestamp']}\n"
+                f"{r['type']} | {rupiah(r['amount'])}\n"
+                f"Sisa : {rupiah(r['saldo_sisa'])}\n"
+                f"Leak : {r['leak']}\n\n"
             )
 
-        if leak:
-            msg += "🛑 KEBOCORAN PEMBELIAN\n\n"
-            for r in leak:
-                msg += (
-                    f"- Rp {r['amount']:,}\n"
-                    f"  {r['time'].strftime('%d %b %Y %H:%M')} | {r['note']}\n\n"
-                )
+        await loading.edit_text(msg)
 
-        await update.message.reply_text(msg)
-
-    # ===== EXIT =====
-    elif text == "❌ Exit":
-        context.user_data.clear()
+    # ================= LIHAT SPREADSHEET =================
+    elif text == "📈 Lihat Spreadsheet":
         await update.message.reply_text(
-            "👋 Sampai jumpa bos!",
-            reply_markup=ReplyKeyboardRemove()
+            "✉️ Masukkan email kamu untuk share spreadsheet (contoh: kamu@mail.com):"
         )
+        context.user_data["await_email"] = True
 
-    else:
-        await update.message.reply_text(
-            "❓ Pakai tombol menu ya.",
-            reply_markup=MENU
-        )
+    # ================= HANDLE EMAIL =================
+    elif "await_email" in context.user_data:
+        email = text.strip()
+        context.user_data.pop("await_email")
 
-# ===== MAIN =====
+        loading = await update.message.reply_text("⏳ Sedang membuat dan share spreadsheet...")
+
+        # Share spreadsheet user ke email
+        ws = create_and_share_user_sheet(chat_id, email)
+
+        await loading.edit_text(f"✅ Spreadsheet Keuangan Kamu sudah siap!\n📊 {get_sheet_url(ws)}")
+
+# ================= MAIN =================
 def main():
-    app = ApplicationBuilder().token(TOKEN).build()
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    print("🤖 Bot keuangan + reminder running...")
+    print("🤖 Bot keuangan running...")
     app.run_polling()
 
 if __name__ == "__main__":
