@@ -23,7 +23,7 @@ SCOPES = [
 ]
 
 creds_dict = json.loads(os.environ.get("GOOGLE_CREDENTIAL_JSON"))
-creds = Credentials.from_service_account_file(
+creds = Credentials.from_service_account_info(
     creds_dict,
     scopes=SCOPES
 )
