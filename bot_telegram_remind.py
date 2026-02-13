@@ -70,7 +70,14 @@ def get_user_sheet(chat_id):
         ws = spreadsheet.worksheet(name)
     except gspread.exceptions.WorksheetNotFound:
         ws = spreadsheet.add_worksheet(title=name, rows=3000, cols=10)
-        ws.append_row(["timestamp", "type", "amount", "note", "leak", "saldo"])
+
+    required = ["timestamp", "type", "amount", "note", "leak", "saldo"]
+
+    header = ws.row_values(1)
+    if header != required:
+        ws.clear()
+        ws.append_row(required)
+
     return ws
 
 def get_all_rows(ws):
