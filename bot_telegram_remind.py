@@ -1,7 +1,14 @@
-import os
-import json
+import os, json, tempfile, asyncio
 from datetime import datetime, timedelta
-from telegram import Update, ReplyKeyboardMarkup
+
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from telegram import (
+    Update,
+    ReplyKeyboardMarkup,
+    InputFile,
+)
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -10,15 +17,11 @@ from telegram.ext import (
     filters,
 )
 
-import pandas as pd
-import matplotlib.pyplot as plt
-import tempfile
-
 import gspread
 from google.oauth2.service_account import Credentials
 
 # ================= CONFIG =================
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
+BOT_TOKEN = os.environ["BOT_TOKEN"]
 SPREADSHEET_NAME = "BOT Keuangan"
 
 # ================= GOOGLE SHEET =================
@@ -31,39 +34,62 @@ creds = Credentials.from_service_account_info(cred_info, scopes=SCOPES)
 client = gspread.authorize(creds)
 spreadsheet = client.open(SPREADSHEET_NAME)
 
+# ================= KEYBOARD =================
+MAIN_KEYBOARD = ReplyKeyboardMarkup(
+    [
+        ["💰 Pemasukan", "💸 Pengeluaran"],
+        ["📊 Summary", "📋 Catatan Hari Ini"],
+        ["📊 Menu Chart", "📈 Share Spreadsheet"],
+    ],
+    resize_keyboard=True,
+)
+
+CHART_KEYBOARD = ReplyKeyboardMarkup(
+    [
+        ["📅 Chart Harian", "🗓️ Chart Bulanan"],
+        ["🏷️ Top Kategori"],
+        ["⬅️ Kembali"],
+    ],
+    resize_keyboard=True,
+)
+
 # ================= HELPERS =================
 def rupiah(n):
     return f"Rp {int(n):,}".replace(",", ".")
 
-def now_full():
-    return datetime.now().strftime("%A, %d %B %Y | %H:%M WIB")
-
 def today():
     return datetime.now().strftime("%Y-%m-%d")
+
+def now_full():
+    return datetime.now().strftime("%d %B %Y | %H:%M WIB")
 
 def get_user_sheet(chat_id):
     name = f"user_{chat_id}"
     try:
         ws = spreadsheet.worksheet(name)
     except gspread.exceptions.WorksheetNotFound:
-        ws = spreadsheet.add_worksheet(title=name, rows=1000, cols=10)
-        ws.append_row(["timestamp","type","amount","note","leak","saldo_sisa"])
+        ws = spreadsheet.add_worksheet(title=name, rows=3000, cols=10)
+        ws.append_row(
+            ["timestamp", "type", "amount", "note", "leak", "saldo"]
+        )
     return ws
 
-def get_rows_by_date(ws, date_str):
-    return [r for r in ws.get_all_records() if r["timestamp"].startswith(date_str)]
-
-def get_total_today(ws, tipe):
-    return sum(int(r["amount"]) for r in get_rows_by_date(ws, today()) if r["type"] == tipe)
-
-def get_last_balance(ws):
+def get_all_rows(ws):
     rows = ws.get_all_records()
-    return int(rows[-1]["saldo_sisa"]) if rows else 0
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    df["amount"] = df["amount"].astype(int)
+    return df
 
 def save_record(ws, tipe, amount, note):
-    pemasukan = get_total_today(ws, "Pemasukan")
-    pengeluaran = get_total_today(ws, "Pengeluaran")
-    saldo = get_last_balance(ws)
+    df = get_all_rows(ws)
+    today_df = df[df["timestamp"].dt.strftime("%Y-%m-%d") == today()]
+
+    pemasukan = today_df[today_df["type"] == "Pemasukan"]["amount"].sum()
+    pengeluaran = today_df[today_df["type"] == "Pengeluaran"]["amount"].sum()
+    saldo = int(df.iloc[-1]["saldo"]) if not df.empty else 0
     leak = "NO"
 
     if tipe == "Pemasukan":
@@ -79,123 +105,98 @@ def save_record(ws, tipe, amount, note):
         datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         tipe, amount, note, leak, saldo
     ])
+
     return pemasukan, pengeluaran, saldo, leak
 
-# ================= CHART 7 HARI =================
-def generate_7_days_chart(ws):
-    rows = ws.get_all_records()
-    if not rows:
-        return None
+# ================= BOROS DETECTOR =================
+def detect_today_almost_boros(df):
+    today_df = df[df["timestamp"].dt.strftime("%Y-%m-%d") == today()]
+    pemasukan = today_df[today_df["type"] == "Pemasukan"]["amount"].sum()
+    pengeluaran = today_df[today_df["type"] == "Pengeluaran"]["amount"].sum()
 
-    df = pd.DataFrame(rows)
-    if df.empty:
-        return None
+    if pemasukan > 0 and pengeluaran >= pemasukan * 0.8:
+        return "⚠️ Pengeluaran hari ini sudah 80% dari pemasukan!"
 
-    df["date"] = pd.to_datetime(df["timestamp"]).dt.date
-    last_7 = datetime.now().date() - timedelta(days=6)
-    df = df[df["date"] >= last_7]
-
-    if df.empty:
-        return None
-
-    inc = df[df["type"]=="Pemasukan"].groupby("date")["amount"].sum()
-    exp = df[df["type"]=="Pengeluaran"].groupby("date")["amount"].sum()
-
-    plt.figure()
-    inc.plot(marker="o", label="Pemasukan")
-    exp.plot(marker="o", label="Pengeluaran")
-    plt.title("Grafik Keuangan 7 Hari")
-    plt.xlabel("Tanggal")
-    plt.ylabel("Rupiah")
-    plt.legend()
-    plt.tight_layout()
-
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
-    plt.savefig(tmp.name)
-    plt.close()
-    return tmp.name
-
-# ================= WEEKLY CHECK =================
-def get_week_total(ws, start, end):
-    total = 0
-    for r in ws.get_all_records():
-        d = datetime.strptime(r["timestamp"][:10], "%Y-%m-%d").date()
-        if start <= d <= end and r["type"] == "Pengeluaran":
-            total += int(r["amount"])
-    return total
-
-# ================= DAILY SUMMARY =================
-async def send_daily_summary(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
-    ws = get_user_sheet(chat_id)
-    yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
-    rows = get_rows_by_date(ws, yesterday)
-
-    if not rows:
-        await context.bot.send_message(chat_id, f"📭 Tidak ada transaksi kemarin ({yesterday})")
-        return
-
-    pemasukan = sum(int(r["amount"]) for r in rows if r["type"]=="Pemasukan")
-    pengeluaran = sum(int(r["amount"]) for r in rows if r["type"]=="Pengeluaran")
-    sisa = pemasukan - pengeluaran
-    leak_count = sum(1 for r in rows if r["leak"]=="YES")
-
-    msg = (
-        f"📅 Rekapan Keuangan Kemarin ({yesterday})\n\n"
-        f"💰 Pemasukan : {rupiah(pemasukan)}\n"
-        f"💸 Pengeluaran : {rupiah(pengeluaran)}\n"
-        f"🧮 Sisa dana : {rupiah(sisa)}\n\n"
+    last7 = datetime.now() - timedelta(days=7)
+    df7 = df[df["timestamp"] >= last7]
+    avg = (
+        df7[df7["type"] == "Pengeluaran"]
+        .groupby(df7["timestamp"].dt.date)["amount"]
+        .mean()
     )
 
-    if leak_count:
-        msg += "🚨 Ada pengeluaran melebihi pemasukan\n"
-    if sisa < pemasukan * 0.2:
-        msg += "⚠️ Sisa dana tipis\n"
-    elif sisa > pemasukan * 0.5:
-        msg += "👍 Kondisi keuangan stabil\n"
+    if not avg.empty and pengeluaran > avg.mean():
+        return "⚠️ Pengeluaran hari ini di atas rata-rata mingguan!"
 
-    await context.bot.send_message(chat_id, msg)
+    return None
 
-async def daily_summary_job(context: ContextTypes.DEFAULT_TYPE):
-    for ws in spreadsheet.worksheets():
-        if ws.title.startswith("user_"):
-            await send_daily_summary(context, int(ws.title.replace("user_", "")))
+# ================= CHART =================
+def save_chart(fig):
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
+    fig.savefig(tmp.name)
+    plt.close(fig)
+    return tmp.name
 
-# ================= WEEKLY JOB =================
-async def weekly_spending_job(context: ContextTypes.DEFAULT_TYPE):
-    today = datetime.now().date()
-    start_this = today - timedelta(days=today.weekday())
-    end_this = start_this + timedelta(days=6)
-    start_last = start_this - timedelta(days=7)
-    end_last = start_last + timedelta(days=6)
+def generate_daily_chart(df):
+    last7 = datetime.now() - timedelta(days=6)
+    df7 = df[df["timestamp"] >= last7]
 
-    for ws in spreadsheet.worksheets():
-        if not ws.title.startswith("user_"):
-            continue
+    pivot = (
+        df7.groupby([df7["timestamp"].dt.date, "type"])["amount"]
+        .sum()
+        .unstack(fill_value=0)
+    )
 
-        chat_id = int(ws.title.replace("user_", ""))
-        this_week = get_week_total(ws, start_this, end_this)
-        last_week = get_week_total(ws, start_last, end_last)
+    if pivot.empty:
+        return None
 
-        if last_week > 0 and this_week > last_week * 1.3:
-            await context.bot.send_message(
-                chat_id,
-                f"🚨 PERINGATAN BOROS\n\n"
-                f"Minggu lalu : {rupiah(last_week)}\n"
-                f"Minggu ini : {rupiah(this_week)}\n\n"
-                f"Coba evaluasi pengeluaranmu 👀"
-            )
+    fig = pivot.plot(kind="bar", title="Keuangan 7 Hari Terakhir").get_figure()
+    fig.tight_layout()
+    return save_chart(fig)
+
+def generate_monthly_chart(df):
+    dfm = df.copy()
+    dfm["date"] = dfm["timestamp"].dt.date
+
+    pivot = (
+        dfm.groupby(["date", "type"])["amount"]
+        .sum()
+        .unstack(fill_value=0)
+    )
+
+    if pivot.empty:
+        return None
+
+    fig = pivot.plot(title="Chart Bulanan (Harian)").get_figure()
+    fig.tight_layout()
+    return save_chart(fig)
+
+def generate_top_category(df):
+    out = df[df["type"] == "Pengeluaran"]
+    if out.empty:
+        return None, None
+
+    top = (
+        out.groupby("note")["amount"]
+        .sum()
+        .sort_values(ascending=False)
+        .head(5)
+    )
+
+    fig = top.plot(kind="bar", title="Top 5 Kategori Pengeluaran").get_figure()
+    fig.tight_layout()
+
+    text = "🏷️ TOP KATEGORI\n\n"
+    for i, (k, v) in enumerate(top.items(), 1):
+        text += f"{i}. {k} — {rupiah(v)}\n"
+
+    return save_chart(fig), text
 
 # ================= HANDLERS =================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [
-        ["💰 Pemasukan", "💸 Pengeluaran"],
-        ["📊 Summary", "📋 Catatan Hari Ini"],
-        ["📊 Chart 7 Hari"],
-        ["📈 Lihat Spreadsheet"],
-    ]
     await update.message.reply_text(
         "🤖 Bot Keuangan Aktif",
-        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True),
+        reply_markup=MAIN_KEYBOARD,
     )
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -203,81 +204,159 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     ws = get_user_sheet(chat_id)
 
+    # ===== INPUT FLOW =====
     if text in ["💰 Pemasukan", "💸 Pengeluaran"]:
         context.user_data["type"] = "Pemasukan" if "Pemasukan" in text else "Pengeluaran"
         await update.message.reply_text("Masukkan nominal:")
 
     elif "type" in context.user_data and text.isdigit():
         context.user_data["amount"] = int(text)
-        await update.message.reply_text("Masukkan catatan:")
+        await update.message.reply_text("Masukkan catatan / kategori:")
 
     elif "amount" in context.user_data:
-        loading = await update.message.reply_text("⏳ Memproses...")
         tipe = context.user_data["type"]
         amount = context.user_data["amount"]
         note = text
+
         pemasukan, pengeluaran, saldo, leak = save_record(ws, tipe, amount, note)
         context.user_data.clear()
 
-        await loading.edit_text(
-            f"✅ {tipe} dicatat\n\n"
-            f"{now_full()}\n"
+        msg = (
+            f"✅ {tipe} dicatat\n"
+            f"{now_full()}\n\n"
             f"{rupiah(amount)}\n{note}\n\n"
-            f"Sisa hari ini: {rupiah(pemasukan - pengeluaran)}"
+            f"💰 {rupiah(pemasukan)}\n"
+            f"💸 {rupiah(pengeluaran)}\n"
+            f"🧮 Saldo {rupiah(saldo)}"
         )
 
-    elif text == "📊 Chart 7 Hari":
-        chart = generate_7_days_chart(ws)
-        if not chart:
-            await update.message.reply_text("📭 Data belum cukup untuk chart.")
+        if leak == "YES":
+            msg += "\n🚨 LEAK TERDETEKSI"
+
+        await update.message.reply_text(msg, reply_markup=MAIN_KEYBOARD)
+
+        df = get_all_rows(ws)
+        warning = detect_today_almost_boros(df)
+        if warning:
+            await update.message.reply_text(warning)
+
+    # ===== SUMMARY =====
+    elif text == "📊 Summary":
+        df = get_all_rows(ws)
+        today_df = df[df["timestamp"].dt.strftime("%Y-%m-%d") == today()]
+        pemasukan = today_df[today_df["type"] == "Pemasukan"]["amount"].sum()
+        pengeluaran = today_df[today_df["type"] == "Pengeluaran"]["amount"].sum()
+        saldo = int(df.iloc[-1]["saldo"]) if not df.empty else 0
+
+        await update.message.reply_text(
+            f"📊 SUMMARY HARI INI\n\n"
+            f"💰 {rupiah(pemasukan)}\n"
+            f"💸 {rupiah(pengeluaran)}\n"
+            f"🧮 Sisa {rupiah(pemasukan - pengeluaran)}\n"
+            f"💼 Saldo {rupiah(saldo)}"
+        )
+
+    # ===== CATATAN =====
+    elif text == "📋 Catatan Hari Ini":
+        df = get_all_rows(ws)
+        today_df = df[df["timestamp"].dt.strftime("%Y-%m-%d") == today()]
+        if today_df.empty:
+            await update.message.reply_text("📭 Belum ada catatan hari ini.")
             return
-        await context.bot.send_photo(
-            chat_id=chat_id,
-            photo=open(chart, "rb"),
-            caption="📊 Grafik 7 hari terakhir"
-        )
 
-    elif text == "📈 Lihat Spreadsheet":
+        msg = "📋 CATATAN HARI INI\n\n"
+        for _, r in today_df.iterrows():
+            msg += f"{r['timestamp']} | {r['type']} | {rupiah(r['amount'])}\n"
+
+        await update.message.reply_text(msg)
+
+    # ===== SHARE SHEET =====
+    elif text == "📈 Share Spreadsheet":
         context.user_data["awaiting_email"] = True
-        await update.message.reply_text("📧 Masukkan email:")
+        await update.message.reply_text("Masukkan email Google:")
 
     elif context.user_data.get("awaiting_email"):
         spreadsheet.share(text, perm_type="user", role="writer", notify=True)
         context.user_data.clear()
-        await update.message.reply_text(f"✅ Spreadsheet dibagikan ke {text}")
+        await update.message.reply_text("✅ Spreadsheet dibagikan", reply_markup=MAIN_KEYBOARD)
+
+    # ===== CHART MENU =====
+    elif text == "📊 Menu Chart":
+        await update.message.reply_text("📊 Pilih chart:", reply_markup=CHART_KEYBOARD)
+
+    elif text == "📅 Chart Harian":
+        chart = generate_daily_chart(get_all_rows(ws))
+        if chart:
+            await update.message.reply_photo(InputFile(chart))
+
+    elif text == "🗓️ Chart Bulanan":
+        chart = generate_monthly_chart(get_all_rows(ws))
+        if chart:
+            await update.message.reply_photo(InputFile(chart))
+
+    elif text == "🏷️ Top Kategori":
+        chart, text_msg = generate_top_category(get_all_rows(ws))
+        if chart:
+            await update.message.reply_photo(InputFile(chart))
+            await update.message.reply_text(text_msg)
+
+    elif text == "⬅️ Kembali":
+        await update.message.reply_text("Kembali ke menu utama", reply_markup=MAIN_KEYBOARD)
+
+# ================= DAILY JOB =================
+async def daily_job(context: ContextTypes.DEFAULT_TYPE):
+    for ws in spreadsheet.worksheets():
+        if not ws.title.startswith("user_"):
+            continue
+
+        chat_id = int(ws.title.replace("user_", ""))
+        df = get_all_rows(ws)
+        if df.empty:
+            continue
+
+        yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+        ydf = df[df["timestamp"].dt.strftime("%Y-%m-%d") == yesterday]
+        if ydf.empty:
+            continue
+
+        pemasukan = ydf[ydf["type"] == "Pemasukan"]["amount"].sum()
+        pengeluaran = ydf[ydf["type"] == "Pengeluaran"]["amount"].sum()
+
+        await context.bot.send_message(
+            chat_id,
+            f"📅 Rekap {yesterday}\n\n"
+            f"💰 {rupiah(pemasukan)}\n"
+            f"💸 {rupiah(pengeluaran)}\n"
+            f"🧮 Sisa {rupiah(pemasukan - pengeluaran)}"
+        )
+
+        chart = generate_daily_chart(df)
+        if chart:
+            await context.bot.send_photo(chat_id, InputFile(chart))
+
+        warn = detect_today_almost_boros(df)
+        if warn:
+            await context.bot.send_message(chat_id, warn)
 
 # ================= MAIN =================
-if __name__ == "__main__":
+async def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    # anti conflict
-    app.bot.delete_webhook(drop_pending_updates=True)
+    await app.bot.delete_webhook(drop_pending_updates=True)
 
-    # DAILY 00:01
     now = datetime.now()
     target = now.replace(hour=0, minute=1, second=0, microsecond=0)
     if now >= target:
         target += timedelta(days=1)
+    delay = (target - now).total_seconds()
 
-    app.job_queue.run_repeating(
-        daily_summary_job,
-        interval=86400,
-        first=(target - now).total_seconds()
-    )
-
-    # WEEKLY MONDAY 08:00
-    target = now.replace(hour=8, minute=0, second=0, microsecond=0)
-    while target.weekday() != 0:
-        target += timedelta(days=1)
-
-    app.job_queue.run_repeating(
-        weekly_spending_job,
-        interval=7*86400,
-        first=(target - now).total_seconds()
-    )
+    app.job_queue.run_repeating(daily_job, interval=86400, first=delay)
 
     print("🤖 Bot keuangan running...")
-    app.run_polling()
+    await app.run_polling()
+
+if __name__ == "__main__":
+    asyncio.run(main())
